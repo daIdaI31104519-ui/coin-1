@@ -1,0 +1,9 @@
+# Generated research outputs and local Python artifacts
+outputs/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.tmp
+.env
+.env.*
