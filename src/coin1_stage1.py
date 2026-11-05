@@ -8,8 +8,9 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, DecimalException, InvalidOperation, localcontext
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -72,11 +73,10 @@ def data_rows(filename: Path) -> tuple[list[dict], str]:
     raw = filename.read_bytes()
     sha = hashlib.sha256(raw).hexdigest()
     try:
-        with filename.open("r", newline="", encoding="utf-8-sig") as stream:
-            reader = csv.DictReader(stream)
-            if reader.fieldnames != list(HEADERS):
-                raise Stage1Error(f"Expected CSV columns: {', '.join(HEADERS)}", stage="input_format")
-            entries = list(reader)
+        reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
+        if reader.fieldnames != list(HEADERS):
+            raise Stage1Error(f"Expected CSV columns: {', '.join(HEADERS)}", stage="input_format")
+        entries = list(reader)
     except (UnicodeError, csv.Error) as exc:
         raise Stage1Error("Invalid CSV input", stage="input_format") from exc
     if not entries:
@@ -273,19 +273,172 @@ def validate_record(record: dict) -> dict:
         if event["event_id"] in ids:
             raise Stage1Error("Duplicate event id", stage="record_read")
         ids.add(event["event_id"])
+    if record["run_status"] == "completed":
+        try:
+            validate_result_numbers(record)
+        except DecimalException as exc:
+            raise Stage1Error("Decimal arithmetic could not be verified", stage="record_read") from exc
+        validate_completed_times(record)
     return record
+
+
+def record_time(value, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise Stage1Error(f"Invalid timestamp: {field}", stage="record_read")
+    try:
+        return as_utc(value)
+    except Stage1Error as exc:
+        raise Stage1Error(f"Invalid UTC timestamp: {field}", stage="record_read") from exc
+
+
+def validate_completed_times(record: dict) -> None:
+    execution = record["execution"]
+    started = record_time(execution["started_at"], "execution.started_at")
+    ended = record_time(execution["ended_at"], "execution.ended_at")
+    if ended < started:
+        raise Stage1Error("Execution times are reversed", stage="record_read")
+    data = record["data"]
+    market_start = record_time(data["start_at"], "data.start_at") if data.get("start_at") is not None else None
+    last_open = record_time(data["last_bar_open_at"], "data.last_bar_open_at") if data.get("last_bar_open_at") is not None else None
+    as_of = record_time(record["result"]["as_of"], "result.as_of")
+    if ((market_start is not None and market_start > as_of)
+            or (last_open is not None and last_open > as_of)
+            or (market_start is not None and last_open is not None and last_open < market_start)):
+        raise Stage1Error("Market time window is reversed", stage="record_read")
+    previous_event_time = None
+    for event in record["events"]:
+        event_time = record_time(event["at"], "event.at")
+        if ((market_start is not None and event_time < market_start)
+                or event_time > as_of
+                or (previous_event_time is not None and event_time < previous_event_time)):
+            raise Stage1Error("Market event is outside chronological window", stage="record_read")
+        previous_event_time = event_time
+        if "knowledge_cutoff" in event:
+            cutoff = record_time(event["knowledge_cutoff"], "event.knowledge_cutoff")
+            if cutoff != event_time:
+                raise Stage1Error("Decision knowledge cutoff differs", stage="record_read")
+        if "source_bar_start_at" in event:
+            source_start = record_time(event["source_bar_start_at"], "event.source_bar_start_at")
+            if source_start + ONE_HOUR > event_time:
+                raise Stage1Error("Decision used an unclosed bar", stage="record_read")
+        for field in ("intended_open_at", "exit_scheduled_at"):
+            if field in event and record_time(event[field], f"event.{field}") < event_time:
+                raise Stage1Error("Scheduled event precedes its source", stage="record_read")
+    for trade in record["result"]["trades"]:
+        entered = record_time(trade.get("entered_at"), "trade.entered_at")
+        exited = record_time(trade.get("exited_at"), "trade.exited_at")
+        if ((market_start is not None and entered < market_start)
+                or exited <= entered or exited > as_of):
+            raise Stage1Error("Trade times are outside chronological window", stage="record_read")
+
+
+def finite_decimal(value, field: str) -> Decimal:
+    if not isinstance(value, str):
+        raise Stage1Error(f"Invalid decimal field: {field}", stage="record_read")
+    try:
+        amount = Decimal(value)
+    except InvalidOperation as exc:
+        raise Stage1Error(f"Invalid decimal field: {field}", stage="record_read") from exc
+    if not amount.is_finite():
+        raise Stage1Error(f"Nonfinite decimal field: {field}", stage="record_read")
+    return amount
+
+
+def validate_result_numbers(record: dict) -> None:
+    research = record["research"]
+    result = record["result"]
+    if (type(research["N"]) is not int or research["N"] != N
+            or type(research["H_hours"]) is not int or research["H_hours"] != H_HOURS):
+        raise Stage1Error("Research settings differ", stage="record_read")
+    starting_cash = finite_decimal(research.get("starting_cash_usdt"), "starting_cash_usdt")
+    notional = finite_decimal(research["buy_notional_usdt"], "buy_notional_usdt")
+    fee_rate = finite_decimal(research["fee_rate_each_side"], "fee_rate_each_side")
+    slippage = finite_decimal(research["adverse_price_adjustment_each_side"], "adverse_price_adjustment_each_side")
+    if (starting_cash != STARTING_CASH or notional != BUY_NOTIONAL
+            or fee_rate != FEE_RATE or slippage != SLIPPAGE_RATE):
+        raise Stage1Error("Research monetary settings differ", stage="record_read")
+    for field in ("decision_count", "upper_breakout_count", "signal_skipped_count", "closed_trade_count"):
+        if type(result.get(field)) is not int or result[field] < 0:
+            raise Stage1Error(f"Invalid result count: {field}", stage="record_read")
+    trades = result["trades"]
+    if not isinstance(trades, list) or result["closed_trade_count"] != len(trades):
+        raise Stage1Error("Trade count differs", stage="record_read")
+    entries = [event for event in record["events"] if event.get("event_type") == "virtual_entry"]
+    exits = [event for event in record["events"] if event.get("event_type") == "virtual_exit"]
+    if len(entries) != len(trades) or len(exits) != len(trades):
+        raise Stage1Error("Trade events differ", stage="record_read")
+    breakout_events = [event for event in record["events"] if event.get("event_type") == "upper_breakout"]
+    breakout_keys = {(event["at"], event.get("source_bar_start_at")) for event in breakout_events}
+    threshold_count = 0
+    skipped_keys = set()
+    for event in record["events"]:
+        if event.get("event_type") != "no_trade":
+            continue
+        reason = event.get("reason")
+        if reason == "threshold_not_crossed":
+            threshold_count += 1
+        elif reason in ("same_instant_as_exit", "position_already_open", "entry_pending"):
+            key = (event["at"], event.get("source_bar_start_at"))
+            if key not in breakout_keys or key in skipped_keys:
+                raise Stage1Error("Skipped signal differs from breakout", stage="record_read")
+            skipped_keys.add(key)
+        else:
+            raise Stage1Error("Unknown no-trade reason", stage="record_read")
+    if (result["upper_breakout_count"] != len(breakout_events)
+            or result["decision_count"] != len(breakout_events) + threshold_count
+            or result["signal_skipped_count"] != len(skipped_keys)
+            or result["closed_trade_count"] != len(exits)):
+        raise Stage1Error("Result counts differ from events", stage="record_read")
+    with localcontext() as context:
+        context.prec = 34
+        total = ZERO
+        for trade, entry, exit_event in zip(trades, entries, exits):
+            if not isinstance(trade, dict):
+                raise Stage1Error("Invalid trade", stage="record_read")
+            buy_price = finite_decimal(trade.get("buy_price"), "buy_price")
+            quantity = finite_decimal(trade.get("quantity_btc"), "quantity_btc")
+            buy_fee = finite_decimal(trade.get("buy_fee_usdt"), "buy_fee_usdt")
+            sell_price = finite_decimal(trade.get("sell_price"), "sell_price")
+            sell_fee = finite_decimal(trade.get("sell_fee_usdt"), "sell_fee_usdt")
+            trade_pnl = finite_decimal(trade.get("net_pnl_usdt"), "trade net_pnl_usdt")
+            if (buy_price <= ZERO or quantity <= ZERO or sell_price <= ZERO
+                    or buy_fee < ZERO or sell_fee < ZERO
+                    or quantity != notional / buy_price
+                    or buy_fee != notional * fee_rate):
+                raise Stage1Error("Invalid trade quantity or purchase", stage="record_read")
+            gross = quantity * sell_price
+            if sell_fee != gross * fee_rate or trade_pnl != gross - sell_fee - notional - buy_fee:
+                raise Stage1Error("Trade proceeds or PNL differs", stage="record_read")
+            if (entry.get("at") != trade.get("entered_at")
+                    or exit_event.get("at") != trade.get("exited_at")
+                    or any(entry.get(field) != trade.get(field) for field in
+                           ("buy_price", "quantity_btc", "buy_fee_usdt"))
+                    or any(exit_event.get(field) != trade.get(field) for field in
+                           ("buy_price", "quantity_btc", "buy_fee_usdt", "sell_price", "sell_fee_usdt", "net_pnl_usdt"))):
+                raise Stage1Error("Trade event values differ", stage="record_read")
+            reference_open = finite_decimal(entry.get("reference_open"), "reference_open")
+            if reference_open <= ZERO or buy_price != reference_open * (ONE + slippage):
+                raise Stage1Error("Entry reference price differs", stage="record_read")
+            total += trade_pnl
+        if (finite_decimal(result["net_pnl_usdt"], "net_pnl_usdt") != total
+                or finite_decimal(result["final_cash_usdt"], "final_cash_usdt") != starting_cash + total):
+            raise Stage1Error("Aggregate PNL or final cash differs", stage="record_read")
+
+
+def reject_json_constant(value: str):
+    raise ValueError(f"Nonfinite JSON constant: {value}")
 
 
 def load_record(path: Path) -> dict:
     try:
         with path.open("r", encoding="utf-8") as stream:
-            data = json.load(stream)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            data = json.load(stream, parse_constant=reject_json_constant)
+    except (OSError, UnicodeError, ValueError) as exc:
         raise Stage1Error(f"Cannot read valid JSON: {exc}", stage="record_read") from exc
     return validate_record(data)
 
 
-def atomic_save(path: Path, record: dict) -> None:
+def atomic_save(path: Path, record: dict, *, verify_before_publish: bool = False) -> None:
     """Atomic replacement on same filesystem; NOT a power-loss durability guarantee."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_name: str | None = None
@@ -296,6 +449,8 @@ def atomic_save(path: Path, record: dict) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if verify_before_publish and load_record(Path(temp_name)) != record:
+            raise Stage1Error("Completed candidate differs from saved JSON", stage="record_verify")
         os.replace(temp_name, path)
     finally:
         if temp_name is not None:
@@ -311,8 +466,12 @@ def execute_experiment(filename: Path, out_dir: Path, *, run_id: str | None = No
     if not run_id.isascii() or not run_id.replace("_", "").replace("-", "").isalnum():
         raise Stage1Error("Invalid run_id", stage="setup")
     path = out_dir / (run_id + ".json")
-    if path.exists():
-        raise Stage1Error("Existing run must not be overwritten", stage="setup")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8"):
+            pass
+    except FileExistsError as exc:
+        raise Stage1Error("Existing run must not be overwritten", stage="setup") from exc
     record = new_record(run_id, filename)
     try:
         atomic_save(path, record)
@@ -321,10 +480,7 @@ def execute_experiment(filename: Path, out_dir: Path, *, run_id: str | None = No
         simulate(rows, record)
         record["run_status"] = "completed"
         record["execution"]["ended_at"] = utc_now()
-        atomic_save(path, record)
-        saved = load_record(path)
-        if saved != record:
-            raise Stage1Error("Saved record differs from in-memory record", stage="record_verify")
+        atomic_save(path, record, verify_before_publish=True)
         return path
     except Exception as exc:
         # Save the failure if possible. A broken storage device may prevent this.
