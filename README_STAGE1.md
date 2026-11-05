@@ -47,4 +47,4 @@ python src/coin1_stage1.py read --record outputs/<表示されたrun_id>.json
 
 実装②で読み取りやすくするため、実験ID・イベントID・判断根拠・版識別・実行状態を記録します。`source_revision.file_sha256` はコード本体のSHA256で、ローカル未コミット試験では `git_status: unverified` と明示します。
 
-**GitHubのmainには仕様書のみ統合済み。ここに含むPythonコードのGitHub保存・PR・main統合は未実施です。**
+**GitHubへの保存・PR・main統合の状況は、リポジトリのコミット履歴およびPRの実際の状態を参照してください。本READMEの記載のみで統合済みと判断しないでください。**
