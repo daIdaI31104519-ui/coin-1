@@ -279,6 +279,11 @@ class ResearchDiaryTests(unittest.TestCase):
         cases = (("record", "record_version", "0.2"),
                  ("research", "name", "other_method"),
                  ("research", "version", "0.2"),
+                 ("research", "entry_wait_bars", 2),
+                 ("research", "same_instant_policy", "other_policy"),
+                 ("research", "simulation_only", False),
+                 ("data", "symbol", "ETH/USDT"),
+                 ("data", "source", "other_source"),
                  ("event", "event_type", "other_event"),
                  ("exit", "close_reason", "other_reason"),
                  ("exit", "fill_model", "other_model"),
@@ -286,12 +291,51 @@ class ResearchDiaryTests(unittest.TestCase):
         for section, field, value in cases:
             with self.subTest(section=section, field=field):
                 record = copy.deepcopy(self.original)
-                target = (record if section == "record" else record["research"] if section == "research"
-                          else self.event(record, "virtual_exit") if section == "exit"
-                          else self.event(record, "no_trade", -1) if section == "skip"
-                          else record["events"][-1])
-                target[field] = value
-                self.assert_rejected(record)
+                if section == "event":
+                    record["events"].append({"event_id": "evt_999", "run_id": record["run_id"],
+                                             "event_type": value, "at": record["result"]["as_of"]})
+                else:
+                    target = (record if section == "record" else record["research"] if section == "research"
+                              else record["data"] if section == "data"
+                              else self.event(record, "virtual_exit") if section == "exit"
+                              else self.event(record, "no_trade", -1))
+                    target[field] = value
+                path = self.save(record)
+                if section not in ("record", "skip"):
+                    self.assertEqual(stage1.load_record(path), record)
+                output = self.run_diary(path)
+                self.assertEqual(output.returncode, 2)
+                self.assertEqual(output.stdout, "")
+                self.assertIn("未対応", output.stderr)
+                self.assertNotIn(record["run_id"], output.stderr)
+                self.assertNotIn(str(path), output.stderr)
+                self.assertNotIn(str(value), output.stderr)
+
+    def test_D08_invalid_json_numbers_and_missing_profile_are_not_unsupported(self):
+        invalid_json = self.folder / "broken.json"
+        invalid_json.write_text("{", encoding="utf-8")
+        invalid_number = copy.deepcopy(self.original)
+        invalid_number["result"]["net_pnl_usdt"] = "999"
+        missing_profile = copy.deepcopy(self.original)
+        del missing_profile["data"]["volume_unit"]
+        missing_research_version = copy.deepcopy(self.original)
+        del missing_research_version["research"]["version"]
+        empty_event_type = copy.deepcopy(self.original)
+        empty_event_type["events"].append({"event_id": "evt_999", "run_id": empty_event_type["run_id"],
+                                            "event_type": "", "at": empty_event_type["result"]["as_of"]})
+        missing_close_reason = copy.deepcopy(self.original)
+        del self.event(missing_close_reason, "virtual_exit")["close_reason"]
+        for path in (invalid_json, self.save(invalid_number, "number.json"),
+                     self.save(missing_profile, "profile.json"),
+                     self.save(missing_research_version, "research.json"),
+                     self.save(empty_event_type, "event.json"),
+                     self.save(missing_close_reason, "exit.json")):
+            with self.subTest(path=path.name):
+                output = self.run_diary(path)
+                self.assertEqual(output.returncode, 2)
+                self.assertEqual(output.stdout, "")
+                self.assertIn("ERROR:", output.stderr)
+                self.assertNotIn("未対応", output.stderr)
 
     def test_D09_identifier_length_controls_and_original_bytes(self):
         before = self.original_path.read_bytes()
