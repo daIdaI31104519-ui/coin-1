@@ -41,6 +41,10 @@ class DiaryError(Exception):
     """The record cannot be safely rendered as a supported diary."""
 
 
+class UnsupportedDiaryError(DiaryError):
+    """The record uses a known but unsupported diary profile or event."""
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise DiaryError(message)
@@ -98,17 +102,22 @@ def timestamp(value: str) -> str:
 
 def validate_profile(record: dict) -> None:
     identifier(record["run_id"])
-    require(record["record_version"] == "0.1", "未対応の記録版です")
+    if record["record_version"] != "0.1":
+        raise UnsupportedDiaryError("未対応の記録版です")
     research = record["research"]
-    require(research.get("name") == "breakout_connection_test"
-            and research.get("version") == "0.1"
-            and research.get("simulation_only") is True
-            and type(research.get("entry_wait_bars")) is int
+    require(all(field in research for field in
+                ("name", "version", "simulation_only", "entry_wait_bars", "same_instant_policy")),
+            "研究プロフィールが不足しています")
+    if not (research["name"] == "breakout_connection_test"
+            and research["version"] == "0.1"
+            and research["simulation_only"] is True
+            and type(research["entry_wait_bars"]) is int
             and research["entry_wait_bars"] == 1
-            and research.get("same_instant_policy") == "exit_before_signal; signal_recorded_but_no_reentry",
-            "未対応の研究プロフィールです")
-    require(all(record["data"].get(field) == expected for field, expected in PROFILE.items()),
-            "未対応の入力プロフィールです")
+            and research["same_instant_policy"] == "exit_before_signal; signal_recorded_but_no_reentry"):
+        raise UnsupportedDiaryError("未対応の研究プロフィールです")
+    require(all(field in record["data"] for field in PROFILE), "入力プロフィールが不足しています")
+    if not all(record["data"][field] == expected for field, expected in PROFILE.items()):
+        raise UnsupportedDiaryError("未対応の入力プロフィールです")
     utc_time(record["execution"]["started_at"])
     if record["execution"].get("ended_at") is not None:
         utc_time(record["execution"]["ended_at"])
@@ -147,7 +156,7 @@ def validate_completed(record: dict) -> None:
     entries: dict[datetime, dict] = {}
     for index, event in enumerate(events):
         identifier(event["event_id"])
-        require(type(event.get("event_type")) is str, "未知のイベントです")
+        require(type(event.get("event_type")) is str and bool(event["event_type"]), "イベント種別が不正です")
         event_type = event["event_type"]
         instant = utc_time(event["at"])
         if event_type in ("upper_breakout", "entry_scheduled", "no_trade"):
@@ -176,7 +185,9 @@ def validate_completed(record: dict) -> None:
             reservations[intended] = event
         elif event_type == "no_trade":
             reason = event.get("reason")
-            require(type(reason) is str and reason in NO_TRADE_LABELS, "未知の見送り理由です")
+            require(type(reason) is str and bool(reason), "見送り理由が不正です")
+            if reason not in NO_TRADE_LABELS:
+                raise UnsupportedDiaryError("未対応の見送り理由です")
             if reason == "threshold_not_crossed":
                 require(instant not in seen_decisions, "条件未達と突破が重複しています")
                 seen_decisions.add(instant)
@@ -204,16 +215,19 @@ def validate_completed(record: dict) -> None:
                 decimal_text(event.get(field), positive=True)
             decimal_text(event.get("sell_fee_usdt"), nonnegative=True)
             decimal_text(event.get("net_pnl_usdt"))
-            require(event.get("close_reason") == "fixed_two_hour_holding"
-                    and event.get("fill_model") == "next_bar_open_plus_adverse_slippage",
-                    "未対応の決済理由または約定モデルです")
+            require(type(event.get("close_reason")) is str and bool(event["close_reason"])
+                    and type(event.get("fill_model")) is str and bool(event["fill_model"]),
+                    "決済理由または約定モデルが不正です")
+            if (event["close_reason"] != "fixed_two_hour_holding"
+                    or event["fill_model"] != "next_bar_open_plus_adverse_slippage"):
+                raise UnsupportedDiaryError("未対応の決済理由または約定モデルです")
             require(instant in entries, "決済に対応する購入がありません")
             entry = entries.pop(instant)
             require(utc_time(event.get("entered_at")) == utc_time(entry["at"])
                     and utc_time(event.get("exited_at")) == instant,
                     "購入・決済時刻が不整合です")
         else:
-            raise DiaryError("未知のイベントです")
+            raise UnsupportedDiaryError("未対応のイベントです")
     require(not reservations and not entries, "予約または仮想取引が孤立しています")
 
 
@@ -298,8 +312,13 @@ def cli(argv: list[str] | None = None) -> int:
         sys.stdout.flush()
         return 0 if record["run_status"] == "completed" else 1
     except (Stage1Error, DiaryError, KeyError, TypeError, ValueError) as exc:
-        category = "読取・基本検証" if isinstance(exc, Stage1Error) else "日記表示検証"
-        print(f"ERROR: {category}に失敗しました。入力記録を確認してください。", file=sys.stderr)
+        if (isinstance(exc, UnsupportedDiaryError)
+                or (isinstance(exc, Stage1Error) and exc.stage == "record_read"
+                    and exc.args in (("Unsupported record version or status",), ("Unknown no-trade reason",)))):
+            print("ERROR: 未対応の記録形式または研究内容です。", file=sys.stderr)
+        else:
+            category = "読取・基本検証" if isinstance(exc, Stage1Error) else "日記表示検証"
+            print(f"ERROR: {category}に失敗しました。入力記録を確認してください。", file=sys.stderr)
         return 2
     except (OSError, UnicodeError):
         try:
